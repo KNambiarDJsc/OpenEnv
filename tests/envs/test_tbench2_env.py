@@ -1,6 +1,8 @@
 import io
+import json
 import logging
 import os
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -102,6 +104,39 @@ def test_tbench2_reset_budget_falls_back_without_task_toml(monkeypatch, tmp_path
     assert (
         observation.info["verifier_timeout_sec"]
         == tbench2_env_environment._DEFAULT_VERIFIER_TIMEOUT_S
+    )
+
+
+@pytest.mark.parametrize(
+    "verifier_config",
+    [
+        f"[verifier]\ntimeout_sec = {value}\n"
+        for value in ['"slow"', "[1, 2, 3]", "nan", "inf", "-inf", "0", "-1"]
+    ]
+    + ['verifier = "slow"\n', "verifier = [1, 2, 3]\n"],
+)
+@pytest.mark.parametrize("docker_mode", [False, True])
+def test_reset_invalid_verifier_budget_uses_finite_default(
+    monkeypatch, tmp_path: Path, verifier_config: str, docker_mode: bool
+):
+    task = _make_task_dir(tmp_path)
+    (task / "task.toml").write_text(
+        verifier_config + '\n[environment]\ndocker_image = "debian:12"\n'
+    )
+    if docker_mode:
+        monkeypatch.setattr(
+            Tbench2DockerEnvironment, "_start_container", lambda self, *args: None
+        )
+        env = Tbench2DockerEnvironment(tasks_dir=str(tmp_path))
+    else:
+        env = _make_env(monkeypatch, tmp_path, task.name)
+
+    observation = env.reset(task_id=task.name)
+
+    assert observation.info["verifier_timeout_sec"] == 900.0
+    assert (
+        json.loads(observation.model_dump_json())["info"]["verifier_timeout_sec"]
+        == 900.0
     )
 
 
@@ -461,8 +496,11 @@ def test_evaluate_docker_missing_verdict_raises_not_zero(tmp_path: Path):
     assert "rm -rf /tests /logs/verifier" in container.events[-1][1]
 
 
-def test_evaluate_docker_stages_tests_at_verify(tmp_path: Path):
+@pytest.mark.parametrize("timeout_s", [900.0, 0.5])
+def test_evaluate_docker_stages_tests_at_verify(tmp_path: Path, timeout_s: float):
     task = _make_task_dir(tmp_path)
+    with (task / "task.toml").open("a") as handle:
+        handle.write(f"\n[verifier]\ntimeout_sec = {timeout_s}\n")
     env = Tbench2DockerEnvironment()
     container = _FakeContainer()
     env._container = container
@@ -484,7 +522,7 @@ def test_evaluate_docker_stages_tests_at_verify(tmp_path: Path):
     # budget, verdict read from reward.txt — not bare pytest in /task.
     assert "bash /tests/test.sh" in eval_cmd
     assert eval_cmd.startswith("cd /task && ")  # no resolved workdir → /task
-    assert "timeout 900" in eval_cmd
+    assert f"timeout {timeout_s:g}" in eval_cmd
     assert "/logs/verifier/reward.txt" in eval_cmd
     assert "rm -rf /tests /logs/verifier" in container.events[3][1]
 
@@ -508,6 +546,8 @@ def test_evaluate_docker_fallback_without_testsh(tmp_path: Path):
     still against the staged /tests copy."""
     task = _make_task_dir(tmp_path)
     (task / "tests" / "test.sh").unlink()
+    with (task / "task.toml").open("a") as handle:
+        handle.write("\n[verifier]\ntimeout_sec = 0.5\n")
     env = Tbench2DockerEnvironment()
     container = _FakeContainer(exec_output=b"__TB2_EXIT_CODE__:0\n")
     env._container = container
@@ -520,6 +560,48 @@ def test_evaluate_docker_fallback_without_testsh(tmp_path: Path):
     eval_cmd = container.events[2][1]
     assert "pytest -q /tests -rA" in eval_cmd
     assert "test.sh" not in eval_cmd
+    assert "timeout 0.5" in eval_cmd
+
+
+@pytest.mark.parametrize("has_timeout", [False, True])
+def test_fallback_timeout_preserves_exit_marker(tmp_path: Path, has_timeout: bool):
+    """Timeout failure or absence must never run an unbounded verifier."""
+    timeout_args = tmp_path / "timeout-args"
+    if has_timeout:
+        timeout = tmp_path / "timeout"
+        timeout.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$TIMEOUT_ARGS"\nexit 124\n'
+        )
+        timeout.chmod(0o755)
+    verifier_ran = tmp_path / "verifier-ran"
+    uvx = tmp_path / "uvx"
+    uvx.write_text('#!/bin/sh\nprintf ran > "$VERIFIER_RAN"\n')
+    uvx.chmod(0o755)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            tbench2_env_environment._fallback_eval_cmd(str(tmp_path), timeout_s=0.5),
+        ],
+        env={
+            **os.environ,
+            "PATH": str(tmp_path),
+            "TIMEOUT_ARGS": str(timeout_args),
+            "VERIFIER_RAN": str(verifier_ran),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+
+    assert not verifier_ran.exists()
+    if has_timeout:
+        assert timeout_args.read_text().splitlines()[:3] == ["0.5", "bash", "-c"]
+    expected_exit = 124 if has_timeout else 127
+    assert (
+        tbench2_env_environment._parse_exit_code_marker(result.stdout) == expected_exit
+    )
 
 
 def test_evaluate_docker_cleans_up_when_scoring_raises(tmp_path: Path):

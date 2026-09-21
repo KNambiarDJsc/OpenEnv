@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import os
 import re
 import shlex
@@ -167,7 +168,13 @@ def _read_timeout(task_dir: Path, fallback: float) -> float:
     except Exception:
         return fallback
     verifier = data.get("verifier", {})
-    return float(verifier.get("timeout_sec", fallback))
+    if not isinstance(verifier, dict):
+        return fallback
+    try:
+        timeout_s = float(verifier.get("timeout_sec", fallback))
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return timeout_s if math.isfinite(timeout_s) and timeout_s > 0 else fallback
 
 
 # The scoring exec echoes its verdict on a marker line so the caller can parse
@@ -190,14 +197,14 @@ def _canonical_eval_cmd(workdir: str, timeout_s: float | None = None) -> str:
     then, and callers need the pytest diagnostics on failure; the reward
     marker line stays last for parsing.
 
-    ``timeout_s`` bounds test.sh with coreutils ``timeout`` when present in
-    the image. The local mode passes None: its terminal toolkit enforces the
+    ``timeout_s`` bounds test.sh with coreutils ``timeout`` (required in the
+    image). The local mode passes None: its terminal toolkit enforces the
     budget itself. Docker exec has no server-side timeout, so the task's own
     verifier budget is enforced in-shell.
     """
     run = f"bash {_VERIFY_TESTS_DIR}/test.sh"
     if timeout_s is not None:
-        run = f"if command -v timeout >/dev/null 2>&1; then timeout {int(timeout_s)} {run}; else {run}; fi"
+        run = f"timeout {timeout_s:g} {run}"
     return (
         f"cd {shlex.quote(workdir)} && "
         f"{run} > {_VERIFIER_LOG_DIR}/testsh.log 2>&1; "
@@ -238,20 +245,21 @@ def _require_canonical_verdict(reward: float | None, output: str) -> float:
     return reward
 
 
-def _fallback_eval_cmd(workdir: str) -> str:
+def _fallback_eval_cmd(workdir: str, timeout_s: float | None = None) -> str:
     """pytest against the staged tests copy, for task dirs without the
     canonical harness (none of the 89 official TB2 tasks — they all ship
     test.sh — but custom task dirs may only have bare pytest tests). Prefer
     uvx so pytest comes with its own toolchain like the canonical harness
     does. Verify from the same directory the agent worked in.
     """
-    return (
-        f"cd {shlex.quote(workdir)} && "
+    run = (
         "if command -v uvx >/dev/null 2>&1; "
         f"then uvx --with pytest==8.4.1 pytest -q {_VERIFY_TESTS_DIR} -rA; "
-        f"else python -m pytest -q {_VERIFY_TESTS_DIR} -rA; fi; "
-        f"echo {_EXIT_CODE_MARKER}$?"
+        f"else python -m pytest -q {_VERIFY_TESTS_DIR} -rA; fi"
     )
+    if timeout_s is not None:
+        run = f"timeout {timeout_s:g} bash -c {shlex.quote(run)}"
+    return f"cd {shlex.quote(workdir)} && {run}; echo {_EXIT_CODE_MARKER}$?"
 
 
 def _parse_exit_code_marker(output: str) -> int:
@@ -1073,7 +1081,9 @@ class Tbench2DockerEnvironment(
                 )
                 info = {"tests_passed": reward == 1.0, "harness": "tests/test.sh"}
             else:
-                _, output = self._exec_in_container(_fallback_eval_cmd(workdir))
+                _, output = self._exec_in_container(
+                    _fallback_eval_cmd(workdir, timeout_s=verifier_timeout_s)
+                )
                 exit_code = _parse_exit_code_marker(output)
                 reward = 1.0 if exit_code == 0 else 0.0
                 info = {"tests_passed": exit_code == 0, "exit_code": exit_code}
