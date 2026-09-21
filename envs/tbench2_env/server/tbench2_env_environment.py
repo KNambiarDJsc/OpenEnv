@@ -311,6 +311,7 @@ class Tbench2Environment(Environment[Tbench2Action, Tbench2Observation, Tbench2S
 
         self._state = Tbench2State()
         self._task_dir: Path | None = None
+        self._verifier_timeout_s = _DEFAULT_VERIFIER_TIMEOUT_S
         self._terminal_toolkit = None
         self._instruction = ""
         self._workdir = ""
@@ -369,6 +370,9 @@ class Tbench2Environment(Environment[Tbench2Action, Tbench2Observation, Tbench2S
             session_logs_dir=session_logs_dir,
             safe_mode=self.safe_mode,
         )
+        self._verifier_timeout_s = _read_timeout(
+            task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
+        )
 
         self._state = Tbench2State(
             episode_id=episode_id or str(uuid4()),
@@ -388,9 +392,7 @@ class Tbench2Environment(Environment[Tbench2Action, Tbench2Observation, Tbench2S
             session_id=None,
             action_type="reset",
             info={
-                "verifier_timeout_sec": _read_timeout(
-                    task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
-                ),
+                "verifier_timeout_sec": self._verifier_timeout_s,
                 "command_timeout_s": self.command_timeout_s,
             },
             reward=0.0,
@@ -497,6 +499,7 @@ class Tbench2Environment(Environment[Tbench2Action, Tbench2Observation, Tbench2S
     def close(self) -> None:
         self._terminal_toolkit = None
         self._task_dir = None
+        self._verifier_timeout_s = _DEFAULT_VERIFIER_TIMEOUT_S
         self._instruction = ""
 
     def _resolve_task_path(self, task_id: str | None, task_path: str | None) -> Path:
@@ -601,11 +604,8 @@ class Tbench2Environment(Environment[Tbench2Action, Tbench2Observation, Tbench2S
         if self._terminal_toolkit is None:
             raise RuntimeError("Terminal toolkit not initialized.")
 
-        # The task's own verifier budget (task.toml [verifier].timeout_sec) —
-        # heavy tests legitimately run minutes (circuit-fibsqrt declares 3600s).
-        verifier_timeout_s = _read_timeout(
-            self._task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
-        )
+        # Honor the reset-time budget even if the agent edits task.toml.
+        verifier_timeout_s = self._verifier_timeout_s
 
         with self._CANONICAL_EVAL_LOCK:
             try:
@@ -728,6 +728,7 @@ class Tbench2DockerEnvironment(
 
         self._state = Tbench2State()
         self._task_dir: Path | None = None
+        self._verifier_timeout_s = _DEFAULT_VERIFIER_TIMEOUT_S
         self._docker_client = None
         self._container = None
         self._instruction = ""
@@ -809,6 +810,9 @@ class Tbench2DockerEnvironment(
         except Exception:
             self.close()
             raise
+        self._verifier_timeout_s = _read_timeout(
+            task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
+        )
 
         return Tbench2Observation(
             instruction=self._instruction,
@@ -821,9 +825,7 @@ class Tbench2DockerEnvironment(
             action_type="reset",
             info={
                 "docker_image": self._task_image,
-                "verifier_timeout_sec": _read_timeout(
-                    task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
-                ),
+                "verifier_timeout_sec": self._verifier_timeout_s,
             },
             reward=0.0,
             done=False,
@@ -1052,11 +1054,7 @@ class Tbench2DockerEnvironment(
                 {"tests_passed": False, "error": "missing tests"},
             )
 
-        # The task's own verifier budget (task.toml [verifier].timeout_sec) —
-        # heavy tests legitimately run minutes (circuit-fibsqrt declares 3600s).
-        verifier_timeout_s = _read_timeout(
-            self._task_dir, fallback=_DEFAULT_VERIFIER_TIMEOUT_S
-        )
+        verifier_timeout_s = self._verifier_timeout_s
         workdir = self._workdir or "/task"
 
         wipe_ec, wipe_out = self._exec_in_container(
@@ -1126,6 +1124,7 @@ class Tbench2DockerEnvironment(
                 pass
             self._container = None
         self._task_dir = None
+        self._verifier_timeout_s = _DEFAULT_VERIFIER_TIMEOUT_S
         self._instruction = ""
         self._workdir = ""
 

@@ -294,6 +294,67 @@ class _RecordingToolkit:
         return self.output
 
 
+@pytest.mark.parametrize("docker_mode", [False, True])
+@pytest.mark.parametrize("canonical", [False, True])
+@pytest.mark.parametrize(
+    "timeout_value, expected_timeout", [("37.5", 37.5), ("nan", 900.0), (None, 900.0)]
+)
+def test_verifier_budget_frozen_until_next_reset(
+    monkeypatch,
+    tmp_path: Path,
+    staged_paths,
+    docker_mode,
+    canonical,
+    timeout_value,
+    expected_timeout,
+):
+    task = _make_task_dir(tmp_path)
+    if not canonical:
+        (task / "tests" / "test.sh").unlink()
+    original_config = (task / "task.toml").read_text()
+    if timeout_value is not None:
+        (task / "task.toml").write_text(
+            original_config + f"\n[verifier]\ntimeout_sec = {timeout_value}\n"
+        )
+    output = "__TB2_REWARD__:1" if canonical else "__TB2_EXIT_CODE__:0"
+    if docker_mode:
+        monkeypatch.setattr(
+            Tbench2DockerEnvironment,
+            "_start_container",
+            lambda self, *args: setattr(
+                self, "_container", _FakeContainer(output.encode())
+            ),
+        )
+        env = Tbench2DockerEnvironment(tasks_dir=str(tmp_path))
+    else:
+        toolkit = _RecordingToolkit(output)
+        monkeypatch.setattr(
+            tbench2_env_environment,
+            "_require_terminal_toolkit",
+            lambda: lambda **kwargs: toolkit,
+        )
+        env = Tbench2Environment(tasks_dir=str(tmp_path), withhold_tests=False)
+
+    observation = env.reset(task_id=task.name)
+    assert observation.info["verifier_timeout_sec"] == expected_timeout
+    (task / "task.toml").write_text(
+        original_config + "\n[verifier]\ntimeout_sec = 7200\n"
+    )
+
+    for reset_again, budget in enumerate((expected_timeout, 7200.0)):
+        if reset_again:
+            observation = env.reset(task_id=task.name)
+            assert observation.info["verifier_timeout_sec"] == budget
+        if docker_mode:
+            _, reward, _ = env._evaluate_docker()
+            command = env._container.events[-2][1]
+            assert f"timeout {budget:g} " in command
+        else:
+            _, reward, _ = env._evaluate_task()
+            assert toolkit.calls[-1]["timeout"] == budget
+        assert reward == 1.0
+
+
 def test_evaluate_canonical_from_withheld_copy(tmp_path: Path, staged_paths):
     """Full evaluate flow: staging from memory + canonical test.sh scoring."""
     stage_tests, stage_logs = staged_paths
@@ -505,6 +566,7 @@ def test_evaluate_docker_stages_tests_at_verify(tmp_path: Path, timeout_s: float
     container = _FakeContainer()
     env._container = container
     env._task_dir = task
+    env._verifier_timeout_s = timeout_s
 
     output, reward, info = env._evaluate_docker()
 
@@ -552,6 +614,7 @@ def test_evaluate_docker_fallback_without_testsh(tmp_path: Path):
     container = _FakeContainer(exec_output=b"__TB2_EXIT_CODE__:0\n")
     env._container = container
     env._task_dir = task
+    env._verifier_timeout_s = 0.5
 
     output, reward, info = env._evaluate_docker()
 
